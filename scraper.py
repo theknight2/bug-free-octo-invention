@@ -109,9 +109,16 @@ class AddressWatcher:
         
         for fill in fills:
             try:
-                # Create unique ID using tid (transaction ID)
-                tx_hash = str(fill.get('hash', ''))
+                # Extract hash and transaction ID
+                raw_hash = fill.get('hash', '')
                 tx_id = str(fill.get('tid', fill.get('oid', '')))
+                
+                # Validate hash - only use if it's a valid Ethereum-style hash
+                if raw_hash and raw_hash != '0x' and raw_hash != '0x00000000' and len(str(raw_hash)) >= 10:
+                    tx_hash = str(raw_hash)
+                else:
+                    tx_hash = None
+                
                 fill_id = f"{self.address}_{tx_id}"
                 
                 # Skip if seen
@@ -150,12 +157,19 @@ class AddressWatcher:
                 transactions.append(tx)
                 
                 # Log individual transaction
-                hash_display = tx_hash[:10] if tx_hash else tx_id[:10]
-                logger.info(
-                    f"[{self.address[:8]}...{self.address[-6:]}] "
-                    f"{action} {size:,.2f} {coin} @ ${price:,.4f} "
-                    f"(${size * price:,.2f}) | Hash: {hash_display}..."
-                )
+                if tx_hash:
+                    hash_display = tx_hash[:10]
+                    logger.info(
+                        f"[{self.address[:8]}...{self.address[-6:]}] "
+                        f"{action} {size:,.2f} {coin} @ ${price:,.4f} "
+                        f"(${size * price:,.2f}) | Hash: {hash_display}..."
+                    )
+                else:
+                    logger.info(
+                        f"[{self.address[:8]}...{self.address[-6:]}] "
+                        f"{action} {size:,.2f} {coin} @ ${price:,.4f} "
+                        f"(${size * price:,.2f}) | TID: {tx_id}"
+                    )
             except Exception as e:
                 logger.error(f"Error processing fill: {e} | Fill: {fill}")
                 continue
@@ -195,7 +209,7 @@ class AddressWatcher:
                     action = "BUY" if side == 'B' else "SELL"
                     value_usd = size * limit_px
                     
-                    # Create order record
+                    # Create order record (no tx_hash for open orders, they haven't executed yet)
                     order_record = {
                         "timestamp": timestamp,
                         "address": self.address,
@@ -205,7 +219,7 @@ class AddressWatcher:
                         "price": limit_px,
                         "value_usd": value_usd,
                         "fee": 0,  # No fee for open orders yet
-                        "tx_hash": order_id,
+                        "tx_hash": None,  # No hash yet - order hasn't executed
                         "closed_pnl": 0,
                         "order_type": "LIMIT_OPEN"
                     }
