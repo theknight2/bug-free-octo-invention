@@ -1,9 +1,10 @@
-import requests
+import asyncio
+import aiohttp
 import logging
-import time
 from datetime import datetime
-from typing import List, Dict, Set
-from collections import defaultdict
+from typing import List, Dict, Set, Optional
+import sqlite3
+from asyncio import sleep
 
 # Configure logging
 logging.basicConfig(
@@ -14,188 +15,379 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class HyperliquidScraper:
-    """Scraper for Hyperliquid spot transactions."""
+class AddressWatcher:
+    """Individual watcher for a single address - tracks BOTH fills and open orders."""
     
-    def __init__(self):
-        self.base_url = "https://api.hyperliquid.xyz/info"
+    def __init__(self, address: str, scraper: 'AsyncHyperliquidScraper'):
+        self.address = address.strip().lower()
+        if not self.address.startswith('0x') and len(self.address) == 40:
+            self.address = '0x' + self.address
+        self.scraper = scraper
         self.seen_transaction_ids: Set[str] = set()
-        self.spam_threshold = 5  # Default: 5+ coins = spam
+        self.seen_open_order_ids: Set[str] = set()  # Track open orders separately
+        self.previously_open_orders: Set[str] = set()  # Track what was open before
         
-    def get_user_fills(self, address: str) -> List[Dict]:
-        """Fetch user fills (executed orders) from Hyperliquid API."""
-        try:
-            # Ensure address is properly formatted
-            address = address.strip().lower()  # Lowercase for case-insensitive matching
-            
-            # Auto-add 0x prefix if missing but address looks valid (40 hex chars)
-            if not address.startswith('0x') and len(address) == 40:
-                address = '0x' + address
-                logger.info(f"Auto-added 0x prefix to address")
-            
-            if not address.startswith('0x'):
-                logger.error(f"Invalid address format: {address}")
+    async def _make_request_with_retry(
+        self, 
+        session: aiohttp.ClientSession, 
+        payload: Dict,
+        max_retries: int = 3
+    ) -> Optional[List[Dict]]:
+        """Make POST request with exponential backoff retry logic."""
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                async with session.post(
+                    self.scraper.base_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 422:
+                        # Unprocessable entity - don't retry
+                        return []
+                    
+                    response.raise_for_status()
+                    return await response.json()
+                    
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 1s, 2s, 4s
+                    wait_time = 2 ** attempt
+                    logger.warning(
+                        f"[{self.address[:10]}...] Request failed (attempt {attempt + 1}/{max_retries}). "
+                        f"Retrying in {wait_time}s... Error: {e}"
+                    )
+                    await sleep(wait_time)
+                else:
+                    logger.error(
+                        f"[{self.address[:10]}...] All {max_retries} attempts failed. Last error: {e}"
+                    )
+            except Exception as e:
+                # Unexpected error - don't retry
+                logger.error(f"[{self.address[:10]}...] Unexpected error: {e}")
                 return []
-            
-            payload = {
-                "type": "userFills",
-                "user": address
-            }
-            response = requests.post(self.base_url, json=payload, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 422:
-                logger.warning(f"No data available for address {address}")
-            else:
-                logger.error(f"HTTP error for {address}: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Error fetching fills for {address}: {e}")
-            return []
+        
+        return []
     
-    def process_fills(self, address: str, fills: List[Dict]) -> Dict[str, Dict]:
-        """
-        Process fills and aggregate by coin to prevent spam.
-        Returns dict with coin as key and aggregated data.
-        """
-        aggregated = defaultdict(lambda: {"buy": 0.0, "sell": 0.0})
-        new_fills = []
+    async def fetch_fills(self, session: aiohttp.ClientSession) -> List[Dict]:
+        """Fetch filled orders for this address with retry logic."""
+        if not self.address.startswith('0x'):
+            logger.error(f"Invalid address format: {self.address}")
+            return []
+        
+        payload = {
+            "type": "userFills",
+            "user": self.address
+        }
+        
+        result = await self._make_request_with_retry(session, payload)
+        return result if result is not None else []
+    
+    async def fetch_open_orders(self, session: aiohttp.ClientSession) -> List[Dict]:
+        """Fetch open orders for this address with retry logic."""
+        if not self.address.startswith('0x'):
+            logger.error(f"Invalid address format: {self.address}")
+            return []
+        
+        payload = {
+            "type": "openOrders",
+            "user": self.address
+        }
+        
+        result = await self._make_request_with_retry(session, payload)
+        return result if result is not None else []
+    
+    def process_fills(self, fills: List[Dict]) -> List[Dict]:
+        """Process fills - return INDIVIDUAL transactions, no aggregation."""
+        transactions = []
+        
+        if not isinstance(fills, list):
+            logger.error(f"Expected list, got {type(fills)}")
+            return []
         
         for fill in fills:
-            # Create unique ID for this fill
-            fill_id = f"{address}_{fill.get('tid', '')}_{fill.get('time', '')}"
-            
-            # Skip if we've seen this transaction before
-            if fill_id in self.seen_transaction_ids:
-                continue
-            
-            self.seen_transaction_ids.add(fill_id)
-            new_fills.append(fill)
-            
-            # Extract transaction details
-            coin = fill.get('coin', 'UNKNOWN')
-            side = fill.get('side', '').lower()
-            size = float(fill.get('sz', 0))
-            
-            # Aggregate by coin and side
-            if side == 'b':  # Buy
-                aggregated[coin]["buy"] += size
-            elif side == 'a':  # Sell (ask)
-                aggregated[coin]["sell"] += size
-        
-        return dict(aggregated)
-    
-    def format_quantity(self, quantity: float) -> str:
-        """Format quantity with thousand separators."""
-        # Format with 2 decimal places and add thousand separators
-        return f"{quantity:,.2f}"
-    
-    def log_transaction(self, address: str, coin: str, side: str, quantity: float):
-        """Log a transaction in the required format."""
-        formatted_qty = self.format_quantity(quantity)
-        action = "bought" if side == "buy" else "sold"
-        logger.info(f"{address} {action} {formatted_qty} {coin}")
-    
-    def check_addresses(self, addresses: List[str]) -> List[Dict]:
-        """
-        Check all addresses for new transactions and return logs.
-        Returns list of transaction logs for display.
-        
-        Anti-spam: Only shows summary if address has 5+ different coins traded,
-        otherwise shows individual coin transactions.
-        """
-        transaction_logs = []
-        
-        for address in addresses:
-            fills = self.get_user_fills(address)
-            aggregated = self.process_fills(address, fills)
-            
-            # Count total number of coin transactions
-            num_coins = len(aggregated)
-            
-            # Anti-spam: If trading threshold+ different coins, show summary instead
-            if num_coins >= self.spam_threshold:
-                total_buy_coins = sum(1 for amounts in aggregated.values() if amounts["buy"] > 0)
-                total_sell_coins = sum(1 for amounts in aggregated.values() if amounts["sell"] > 0)
-                
-                if total_buy_coins > 0:
-                    logger.info(f"{address} bought {total_buy_coins} different coins (e.g., {', '.join(list(aggregated.keys())[:3])}...)")
-                    transaction_logs.append({
-                        "timestamp": datetime.now(),
-                        "address": address,
-                        "action": "bought",
-                        "quantity": total_buy_coins,
-                        "coin": f"coins ({', '.join(list(aggregated.keys())[:3])}...)"
-                    })
-                
-                if total_sell_coins > 0:
-                    logger.info(f"{address} sold {total_sell_coins} different coins (e.g., {', '.join([k for k, v in aggregated.items() if v['sell'] > 0][:3])}...)")
-                    transaction_logs.append({
-                        "timestamp": datetime.now(),
-                        "address": address,
-                        "action": "sold",
-                        "quantity": total_sell_coins,
-                        "coin": f"coins ({', '.join([k for k, v in aggregated.items() if v['sell'] > 0][:3])}...)"
-                    })
-            else:
-                # Show individual transactions for addresses trading < 5 coins
-                for coin, amounts in aggregated.items():
-                    if amounts["buy"] > 0:
-                        self.log_transaction(address, coin, "buy", amounts["buy"])
-                        transaction_logs.append({
-                            "timestamp": datetime.now(),
-                            "address": address,
-                            "action": "bought",
-                            "quantity": amounts["buy"],
-                            "coin": coin
-                        })
-                    
-                    if amounts["sell"] > 0:
-                        self.log_transaction(address, coin, "sell", amounts["sell"])
-                        transaction_logs.append({
-                            "timestamp": datetime.now(),
-                            "address": address,
-                            "action": "sold",
-                            "quantity": amounts["sell"],
-                            "coin": coin
-                        })
-            
-            # Small delay to avoid rate limiting
-            time.sleep(0.1)
-        
-        return transaction_logs
-    
-    def run(self, addresses: List[str], interval: int = 60):
-        """
-        Run the scraper continuously.
-        
-        Args:
-            addresses: List of Ethereum addresses to monitor
-            interval: Check interval in seconds (default: 60)
-        """
-        logger.info(f"Starting Hyperliquid scraper for {len(addresses)} addresses")
-        logger.info(f"Check interval: {interval} seconds")
-        
-        while True:
             try:
-                self.check_addresses(addresses)
-                time.sleep(interval)
-            except KeyboardInterrupt:
-                logger.info("Scraper stopped by user")
+                # Create unique ID using tid (transaction ID)
+                tx_hash = str(fill.get('hash', ''))
+                tx_id = str(fill.get('tid', fill.get('oid', '')))
+                fill_id = f"{self.address}_{tx_id}"
+                
+                # Skip if seen
+                if fill_id in self.seen_transaction_ids:
+                    continue
+                
+                self.seen_transaction_ids.add(fill_id)
+                
+                # Extract details
+                coin = fill.get('coin', 'UNKNOWN')
+                side = fill.get('side', '').upper()
+                size = float(fill.get('sz', 0))
+                price = float(fill.get('px', 0))
+                timestamp_ms = int(fill.get('time', 0))
+                timestamp = datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.now()
+                fee = float(fill.get('fee', 0))
+                
+                # Determine action
+                action = "BUY" if side == 'B' else "SELL"
+                
+                # Create transaction record
+                tx = {
+                    "timestamp": timestamp,
+                    "address": self.address,
+                    "action": action,
+                    "coin": coin,
+                    "quantity": size,
+                    "price": price,
+                    "value_usd": size * price,
+                    "fee": fee,
+                    "tx_hash": tx_hash if tx_hash else tx_id,
+                    "closed_pnl": float(fill.get('closedPnl', 0)),
+                    "order_type": "FILLED"
+                }
+                
+                transactions.append(tx)
+                
+                # Log individual transaction
+                hash_display = tx_hash[:10] if tx_hash else tx_id[:10]
+                logger.info(
+                    f"[{self.address[:8]}...{self.address[-6:]}] "
+                    f"{action} {size:,.2f} {coin} @ ${price:,.4f} "
+                    f"(${size * price:,.2f}) | Hash: {hash_display}..."
+                )
+            except Exception as e:
+                logger.error(f"Error processing fill: {e} | Fill: {fill}")
+                continue
+        
+        return transactions
+    
+    def process_open_orders(self, orders: List[Dict]) -> List[Dict]:
+        """Process open orders - alert on NEW limit orders."""
+        new_orders = []
+        
+        if not isinstance(orders, list):
+            logger.error(f"Expected list, got {type(orders)}")
+            return []
+        
+        current_open_order_ids = set()
+        
+        for order in orders:
+            try:
+                order_id = str(order.get('oid', ''))
+                if not order_id:
+                    continue
+                
+                current_open_order_ids.add(order_id)
+                
+                # Only alert on NEW orders (not previously seen)
+                if order_id not in self.seen_open_order_ids:
+                    self.seen_open_order_ids.add(order_id)
+                    
+                    # Extract order details
+                    coin = order.get('coin', 'UNKNOWN')
+                    side = order.get('side', '').upper()
+                    size = float(order.get('sz', 0))
+                    limit_px = float(order.get('limitPx', 0))
+                    timestamp_ms = int(order.get('timestamp', 0))
+                    timestamp = datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.now()
+                    
+                    action = "BUY" if side == 'B' else "SELL"
+                    value_usd = size * limit_px
+                    
+                    # Create order record
+                    order_record = {
+                        "timestamp": timestamp,
+                        "address": self.address,
+                        "action": f"{action} LIMIT",  # Mark as limit order
+                        "coin": coin,
+                        "quantity": size,
+                        "price": limit_px,
+                        "value_usd": value_usd,
+                        "fee": 0,  # No fee for open orders yet
+                        "tx_hash": order_id,
+                        "closed_pnl": 0,
+                        "order_type": "LIMIT_OPEN"
+                    }
+                    
+                    new_orders.append(order_record)
+                    
+                    # Log new limit order
+                    logger.info(
+                        f"[{self.address[:8]}...{self.address[-6:]}] "
+                        f"🎯 NEW LIMIT ORDER: {action} {size:,.2f} {coin} @ ${limit_px:,.4f} "
+                        f"(${value_usd:,.2f}) | OID: {order_id[:10]}..."
+                    )
+            except Exception as e:
+                logger.error(f"Error processing open order: {e} | Order: {order}")
+                continue
+        
+        # Detect cancelled/filled orders (were open, now closed)
+        closed_orders = self.previously_open_orders - current_open_order_ids
+        if closed_orders:
+            for oid in closed_orders:
+                logger.info(
+                    f"[{self.address[:8]}...{self.address[-6:]}] "
+                    f"📝 Limit order closed/filled: {oid[:10]}..."
+                )
+        
+        # Update previously open orders
+        self.previously_open_orders = current_open_order_ids
+        
+        return new_orders
+    
+    async def check(self, session: aiohttp.ClientSession) -> List[Dict]:
+        """Check for both new fills AND open orders."""
+        # Fetch both concurrently
+        fills_task = self.fetch_fills(session)
+        orders_task = self.fetch_open_orders(session)
+        
+        fills, orders = await asyncio.gather(fills_task, orders_task)
+        
+        # Process both
+        filled_txs = self.process_fills(fills)
+        open_order_alerts = self.process_open_orders(orders)
+        
+        # Combine results
+        return filled_txs + open_order_alerts
+
+
+class AsyncHyperliquidScraper:
+    """Async scraper with individual watchers - ALL transactions visible."""
+    
+    def __init__(self, db_path: str = "hyperliquid.db"):
+        self.base_url = "https://api.hyperliquid.xyz/info"
+        self.watchers: Dict[str, AddressWatcher] = {}
+        self.db_path = db_path
+        self.is_running = False
+        self._logged_addresses = set()  # Track logged addresses to avoid duplicates
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize SQLite database for persistence."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME,
+                    address TEXT,
+                    action TEXT,
+                    coin TEXT,
+                    quantity REAL,
+                    price REAL,
+                    value_usd REAL,
+                    fee REAL,
+                    tx_hash TEXT,
+                    closed_pnl REAL,
+                    order_type TEXT DEFAULT 'FILLED',
+                    UNIQUE(address, tx_hash, timestamp)
+                )
+            """)
+            conn.commit()
+    
+    def add_address(self, address: str):
+        """Add an address to monitor."""
+        address = address.strip().lower()
+        if not address.startswith('0x') and len(address) == 40:
+            address = '0x' + address
+        
+        if address not in self.watchers:
+            watcher = AddressWatcher(address, self)
+            self.watchers[address] = watcher
+            # Only log if not already logged
+            if not hasattr(self, '_logged_addresses'):
+                self._logged_addresses = set()
+            if address not in self._logged_addresses:
+                logger.info(f"✓ Watcher added: {address[:8]}...{address[-6:]}")
+                self._logged_addresses.add(address)
+    
+    def remove_address(self, address: str):
+        """Remove an address from monitoring."""
+        address = address.strip().lower()
+        if address in self.watchers:
+            del self.watchers[address]
+            logger.info(f"✗ Watcher removed: {address[:8]}...{address[-6:]}")
+    
+    async def check_all_addresses(self) -> List[Dict]:
+        """Check all addresses concurrently."""
+        if not self.watchers:
+            return []
+        
+        async with aiohttp.ClientSession() as session:
+            # Run all watchers concurrently
+            tasks = [
+                watcher.check(session)
+                for watcher in self.watchers.values()
+            ]
+            
+            # Gather all results
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Flatten and filter errors
+            transactions = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Watcher error: {result}")
+                elif isinstance(result, list):
+                    transactions.extend(result)
+            
+            # Save to database
+            self._save_transactions(transactions)
+            
+            return transactions
+    
+    def _save_transactions(self, transactions: List[Dict]):
+        """Save transactions to database."""
+        if not transactions:
+            return
+        
+        with sqlite3.connect(self.db_path) as conn:
+            for tx in transactions:
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO transactions 
+                        (timestamp, address, action, coin, quantity, price, value_usd, fee, tx_hash, closed_pnl, order_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        tx["timestamp"].isoformat(),
+                        tx["address"],
+                        tx["action"],
+                        tx["coin"],
+                        tx["quantity"],
+                        tx["price"],
+                        tx["value_usd"],
+                        tx["fee"],
+                        tx["tx_hash"],
+                        tx["closed_pnl"],
+                        tx.get("order_type", "FILLED")
+                    ))
+                except Exception as e:
+                    logger.error(f"DB error: {e}")
+            conn.commit()
+    
+    async def run(self, interval: int = 60):
+        """Run the scraper continuously."""
+        self.is_running = True
+        logger.info(f"🚀 Async scraper started: {len(self.watchers)} watchers")
+        logger.info(f"⏱️  Check interval: {interval}s")
+        
+        while self.is_running:
+            try:
+                start_time = datetime.now()
+                await self.check_all_addresses()
+                elapsed = (datetime.now() - start_time).total_seconds()
+                
+                logger.debug(f"✓ Check completed in {elapsed:.2f}s")
+                await asyncio.sleep(interval)
+                
+            except asyncio.CancelledError:
+                logger.info("⏹️  Scraper stopped")
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                time.sleep(interval)
-
-
-if __name__ == "__main__":
-    # Example usage
-    addresses = [
-        '0x37cbd9Eb9c9Ef1Ec23fdc27686E44cF557e8A4F8',
-        '0x51396D7fae25D68bDA9f0d004c44DCd696ee5D19'
-    ]
+                logger.error(f"❌ Error in main loop: {e}")
+                await asyncio.sleep(interval)
     
-    scraper = HyperliquidScraper()
-    scraper.run(addresses)
+    def stop(self):
+        """Stop the scraper."""
+        self.is_running = False
 
