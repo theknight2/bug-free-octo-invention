@@ -848,8 +848,13 @@ if st.session_state.transactions:
         else:
             action_class = "tx-buy" if "BUY" in tx['action'] else "tx-sell"
         
-        hash_short = tx['tx_hash'][:8] if tx['tx_hash'] else "N/A"
-        hyperliquid_url = f"https://app.hyperliquid.xyz/explorer/tx/{tx['tx_hash']}"
+        # Only create link if we have a valid hash
+        if tx['tx_hash'] and tx['tx_hash'].startswith('0x'):
+            hash_short = tx['tx_hash'][:10]
+            hyperliquid_url = f"https://app.hyperliquid.xyz/explorer/tx/{tx['tx_hash']}"
+        else:
+            hash_short = "N/A"
+            hyperliquid_url = None
         
         # Determine row class based on value
         value_usd = tx['value_usd']
@@ -872,6 +877,12 @@ if st.session_state.transactions:
         addr_index = st.session_state.addresses.index(tx['address']) if tx['address'] in st.session_state.addresses else 0
         addr_color_class = f"address-color-{addr_index % 5}"
         
+        # Render hash with or without link
+        if hyperliquid_url:
+            hash_cell = f'<a href="{hyperliquid_url}" target="_blank" class="tx-hash">{hash_short}</a>'
+        else:
+            hash_cell = f'<span class="tx-hash" style="color: #6E7681;">{hash_short}</span>'
+        
         st.markdown(f"""
             <div class="{row_class}">
                 <div class="tx-cell" style="font-size: 13px;">{time_str}</div>
@@ -881,7 +892,7 @@ if st.session_state.transactions:
                 <div class="tx-cell" style="font-weight: 600; font-size: 13px;">{tx['coin']}</div>
                 <div class="tx-cell" style="font-size: 12px;">${tx['price']:,.4f}</div>
                 <div class="tx-cell">{value_display}</div>
-                <div class="tx-cell"><a href="{hyperliquid_url}" target="_blank" class="tx-hash">{hash_short}</a></div>
+                <div class="tx-cell">{hash_cell}</div>
             </div>
         """, unsafe_allow_html=True)
     

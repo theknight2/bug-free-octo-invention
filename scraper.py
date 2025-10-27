@@ -142,7 +142,7 @@ class AddressWatcher:
                     "price": price,
                     "value_usd": size * price,
                     "fee": fee,
-                    "tx_hash": tx_hash if tx_hash else tx_id,
+                    "tx_hash": tx_hash,  # Always use actual hash for explorer links
                     "closed_pnl": float(fill.get('closedPnl', 0)),
                     "order_type": "FILLED"
                 }
