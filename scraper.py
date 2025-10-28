@@ -113,8 +113,10 @@ class AddressWatcher:
                 raw_hash = fill.get('hash', '')
                 tx_id = str(fill.get('tid', fill.get('oid', '')))
                 
-                # Validate hash - only use if it's a valid Ethereum-style hash
-                if raw_hash and raw_hash != '0x' and raw_hash != '0x00000000' and len(str(raw_hash)) >= 10:
+                # Validate hash - filter out empty/zero hashes
+                # Zero hash is 66 chars: 0x + 64 zeros
+                zero_hash = '0x' + '0' * 64
+                if raw_hash and raw_hash != '0x' and raw_hash != zero_hash and len(str(raw_hash)) == 66:
                     tx_hash = str(raw_hash)
                 else:
                     tx_hash = None
