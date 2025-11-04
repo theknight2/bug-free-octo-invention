@@ -99,28 +99,32 @@ def get_dte_and_t(expiry_date):
 st.markdown('<div class="main-title">Bloom Energy - $220 Strike Theoretical Pricing</div>', unsafe_allow_html=True)
 
 # Input parameters
-col1, col2, col3 = st.columns([2, 2, 2])
+col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
 
 with col1:
     spot_price = st.slider("Spot Price", 120.0, 160.0, 137.0, 1.0)
 
 with col2:
-    iv_percent = st.slider("Implied Volatility (%)", 100, 130, 130, 1)
+    call_iv_percent = st.slider("Call IV (%)", 80, 150, 130, 1)
 
 with col3:
+    put_iv_percent = st.slider("Put IV (%)", 80, 150, 130, 1)
+
+with col4:
     reference_value = spot_price * 0.125
     st.metric("12.5% Reference", f"${reference_value:.2f}")
 
 st.markdown("---")
 
-iv_decimal = iv_percent / 100.0
+call_iv_decimal = call_iv_percent / 100.0
+put_iv_decimal = put_iv_percent / 100.0
 
 # Calculate prices
 results = []
 for exp_name, exp_date in EXPIRATIONS.items():
     dte, T = get_dte_and_t(exp_date)
-    call_result = black_scholes_merton(spot_price, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, iv_decimal, 'call')
-    put_result = black_scholes_merton(spot_price, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, iv_decimal, 'put')
+    call_result = black_scholes_merton(spot_price, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, call_iv_decimal, 'call')
+    put_result = black_scholes_merton(spot_price, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, put_iv_decimal, 'put')
 
     results.append({
         'Expiration': f"{exp_name} ({dte} DTE)",
@@ -160,7 +164,7 @@ with col1:
     colors = ['#4A90E2', '#50C878', '#9B59B6']
     for i, (exp_name, exp_date) in enumerate(EXPIRATIONS.items()):
         dte, T = get_dte_and_t(exp_date)
-        prices = [black_scholes_merton(s, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, iv_decimal, 'call')['price'] for s in spot_range]
+        prices = [black_scholes_merton(s, STRIKE, T, RISK_FREE_RATE, DIVIDEND_YIELD, call_iv_decimal, 'call')['price'] for s in spot_range]
         fig1.add_trace(go.Scatter(x=spot_range, y=prices, mode='lines', name=exp_name,
                                    line=dict(color=colors[i], width=2)))
 
@@ -181,7 +185,7 @@ with col1:
 
 with col2:
     st.subheader("Price vs IV")
-    iv_range = np.linspace(1.00, 1.30, 31)
+    iv_range = np.linspace(0.80, 1.50, 71)
     fig2 = go.Figure()
 
     for i, (exp_name, exp_date) in enumerate(EXPIRATIONS.items()):
